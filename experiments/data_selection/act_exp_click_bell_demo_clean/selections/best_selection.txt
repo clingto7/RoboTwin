@@ -1,0 +1,1 @@
+/home/m1zu/ws/RoboTwin/experiments/data_selection/act_exp_click_bell_demo_clean/selections/selection_greedy_maxdist_seed0.json

@@ -1,0 +1,2 @@
+selection_file,seed,strategy,primary_metric,primary_metric_value,cosine_distance,l2_distance,variance_score,selected_episode_ids
+/home/m1zu/ws/RoboTwin/experiments/data_selection/act_exp_click_bell_demo_clean/selections/selection_greedy_maxdist_seed0.json,0,greedy_maxdist,cosine_distance,0.2980269491672516,0.2980269491672516,29.481454849243164,1.1829549074172974,"44,47,33,22,31,23,13,0,36,29,12,14,7,10,35,1,18,8,41,39"
