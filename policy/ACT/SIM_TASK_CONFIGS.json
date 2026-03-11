@@ -8,5 +8,25 @@
             "cam_right_wrist",
             "cam_left_wrist"
         ]
+    },
+    "sim-click_bell-demo_clean-20-sel0": {
+        "dataset_dir": "./processed_data/sim-click_bell/demo_clean-20-sel0",
+        "num_episodes": 20,
+        "episode_len": 1000,
+        "camera_names": [
+            "cam_high",
+            "cam_right_wrist",
+            "cam_left_wrist"
+        ]
+    },
+    "sim-click_bell-demo_randomized-50-sel45": {
+        "dataset_dir": "./processed_data/sim-click_bell/demo_randomized-50-sel45",
+        "num_episodes": 50,
+        "episode_len": 1000,
+        "camera_names": [
+            "cam_high",
+            "cam_right_wrist",
+            "cam_left_wrist"
+        ]
     }
 }
