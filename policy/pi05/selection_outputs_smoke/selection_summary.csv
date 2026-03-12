@@ -1,0 +1,2 @@
+selection_file,seed,strategy,metric_level,primary_metric,primary_metric_value,cosine_distance,l2_distance,variance_score,feature_mean,feature_std,feature_var,selected_episode_ids
+policy/pi05/selection_outputs_smoke/selection_random_subsets_seed78.json,78,random_subsets,episode,cosine_distance,0.0,0.0,0.0,0.0,0.017720043659210205,2.2439632415771484,5.03537130355835,23
