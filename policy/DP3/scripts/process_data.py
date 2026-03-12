@@ -1,13 +1,22 @@
-import pickle, os
+import os
 import numpy as np
-import pdb
-from copy import deepcopy
 import zarr
 import shutil
 import argparse
-import yaml
-import cv2
 import h5py
+import json
+
+
+def load_episode_ids(episode_ids_file):
+    if episode_ids_file is None:
+        return None
+    with open(episode_ids_file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if isinstance(payload, dict) and "selected_episode_ids" in payload:
+        return [int(x) for x in payload["selected_episode_ids"]]
+    if isinstance(payload, list):
+        return [int(x) for x in payload]
+    raise ValueError("episode ids file must be a list or contain selected_episode_ids")
 
 
 def load_hdf5(dataset_path):
@@ -43,6 +52,8 @@ def main():
         type=int,
         help="Number of episodes to process (e.g., 50)",
     )
+    parser.add_argument("--episode-ids-file", type=str, default=None)
+    parser.add_argument("--subset-tag", type=str, default="")
     args = parser.parse_args()
 
     task_name = args.task_name
@@ -50,10 +61,13 @@ def main():
     task_config = args.task_config
 
     load_dir = "../../data/" + str(task_name) + "/" + str(task_config)
+    subset_tag = args.subset_tag.strip()
+    selected_episode_ids = load_episode_ids(args.episode_ids_file)
 
     total_count = 0
 
-    save_dir = f"./data/{task_name}-{task_config}-{num}.zarr"
+    suffix = f"-{subset_tag}" if subset_tag else ""
+    save_dir = f"./data/{task_name}-{task_config}-{num}{suffix}.zarr"
 
     if os.path.exists(save_dir):
         shutil.rmtree(save_dir)
@@ -65,17 +79,18 @@ def main():
     zarr_meta = zarr_root.create_group("meta")
 
     point_cloud_arrays = []
-    episode_ends_arrays, action_arrays, state_arrays, joint_action_arrays = (
-        [],
-        [],
-        [],
-        [],
-    )
+    episode_ends_arrays, state_arrays, joint_action_arrays = ([], [], [])
 
-    while current_ep < num:
+    if selected_episode_ids is None:
+        episode_order = list(range(num))
+    else:
+        episode_order = selected_episode_ids[:num]
+
+    while current_ep < len(episode_order):
         print(f"processing episode: {current_ep + 1} / {num}", end="\r")
 
-        load_path = os.path.join(load_dir, f"data/episode{current_ep}.hdf5")
+        episode_id = episode_order[current_ep]
+        load_path = os.path.join(load_dir, f"data/episode{episode_id}.hdf5")
         (
             left_gripper_all,
             left_arm_all,
@@ -86,7 +101,6 @@ def main():
         ) = load_hdf5(load_path)
 
         for j in range(0, left_gripper_all.shape[0]):
-
             pointcloud = pointcloud_all[j]
             joint_state = vector_all[j]
 
@@ -106,7 +120,7 @@ def main():
         state_arrays = np.array(state_arrays)
         point_cloud_arrays = np.array(point_cloud_arrays)
         joint_action_arrays = np.array(joint_action_arrays)
-    
+
         compressor = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
         state_chunk_size = (100, state_arrays.shape[1])
         joint_chunk_size = (100, joint_action_arrays.shape[1])
@@ -141,12 +155,15 @@ def main():
             overwrite=True,
             compressor=compressor,
         )
-    except ZeroDivisionError as e:
-        print("If you get a `ZeroDivisionError: division by zero`, check that `data/pointcloud` in the task config is set to true.")
-        raise 
+    except ZeroDivisionError:
+        print(
+            "If you get a `ZeroDivisionError: division by zero`, check that `data/pointcloud` in the task config is set to true."
+        )
+        raise
     except Exception as e:
         print(f"An unexpected error occurred ({type(e).__name__}): {e}")
         raise
+
 
 if __name__ == "__main__":
     main()
