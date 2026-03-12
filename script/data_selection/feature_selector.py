@@ -16,6 +16,13 @@ MetricFn = Callable[[torch.Tensor], float]
 SelectorFn = Callable[[torch.Tensor, int, int], list[int]]
 
 
+DEFAULT_CAMERA_CANDIDATES = (
+    "head_camera",
+    "cam_high",
+    "middle_camera",
+)
+
+
 def _cosine_distance(features: torch.Tensor) -> float:
     if features.shape[0] < 2:
         return 0.0
@@ -41,11 +48,36 @@ def _variance_score(features: torch.Tensor) -> float:
     return float(features.var(dim=0).mean().item())
 
 
+def _feature_mean(features: torch.Tensor) -> float:
+    return float(features.mean().item())
+
+
+def _feature_std(features: torch.Tensor) -> float:
+    if features.numel() < 2:
+        return 0.0
+    return float(features.std(unbiased=False).item())
+
+
+def _feature_var(features: torch.Tensor) -> float:
+    if features.numel() < 2:
+        return 0.0
+    return float(features.var(unbiased=False).item())
+
+
 METRIC_REGISTRY: dict[str, MetricFn] = {
     "cosine_distance": _cosine_distance,
     "l2_distance": _l2_distance,
     "variance_score": _variance_score,
+    "feature_mean": _feature_mean,
+    "feature_std": _feature_std,
+    "feature_var": _feature_var,
 }
+
+
+def register_metric(name: str, metric_fn: MetricFn) -> None:
+    if name in METRIC_REGISTRY:
+        raise ValueError(f"metric already registered: {name}")
+    METRIC_REGISTRY[name] = metric_fn
 
 
 def _select_random(embeddings: torch.Tensor, n_select: int, seed: int) -> list[int]:
@@ -55,6 +87,12 @@ def _select_random(embeddings: torch.Tensor, n_select: int, seed: int) -> list[i
     g = torch.Generator()
     g.manual_seed(seed)
     return sorted(torch.randperm(n, generator=g)[:n_select].tolist())
+
+
+def _select_random_subsets(
+    embeddings: torch.Tensor, n_select: int, seed: int
+) -> list[int]:
+    return _select_random(embeddings, n_select, seed)
 
 
 def _select_greedy_maxdist(
@@ -153,10 +191,17 @@ def _select_kmeans(embeddings: torch.Tensor, n_select: int, seed: int) -> list[i
 
 SELECTOR_REGISTRY: dict[str, SelectorFn] = {
     "random": _select_random,
+    "random_subsets": _select_random_subsets,
     "greedy_maxdist": _select_greedy_maxdist,
     "greedy_maxvar": _select_greedy_maxvar,
     "kmeans": _select_kmeans,
 }
+
+
+def register_selector(name: str, selector_fn: SelectorFn) -> None:
+    if name in SELECTOR_REGISTRY:
+        raise ValueError(f"selector already registered: {name}")
+    SELECTOR_REGISTRY[name] = selector_fn
 
 
 @dataclass
@@ -165,7 +210,18 @@ class EpisodeEmbeddingResult:
     embeddings: torch.Tensor
 
 
+def _default_camera_key(cameras: list[str]) -> str:
+    for candidate in DEFAULT_CAMERA_CANDIDATES:
+        if candidate in cameras:
+            return candidate
+    if len(cameras) >= 3:
+        return sorted(cameras)[len(cameras) // 2]
+    return cameras[0]
+
+
 def _sample_indices(total: int, n: int) -> list[int]:
+    if n <= 1:
+        return [0] if total > 0 else []
     if total <= n:
         return list(range(total))
     step = (total - 1) / float(n - 1)
@@ -178,22 +234,39 @@ def _decode_rgb(frame_bytes: bytes) -> Image.Image:
     return Image.fromarray(rgb)
 
 
+def _extract_cls_feature_batches(
+    frames: np.ndarray,
+    model,
+    transform,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
+    features: list[torch.Tensor] = []
+    total = len(frames)
+    for start in range(0, total, batch_size):
+        batch_frames = frames[start : start + batch_size]
+        tensors = torch.stack([transform(_decode_rgb(frame)) for frame in batch_frames])
+        from extract_feature.extract_image_features import extract_cls_features
+
+        cls = extract_cls_features(model, tensors, device)
+        features.append(cls.cpu())
+    return torch.cat(features, dim=0)
+
+
 def build_episode_embeddings(
     episode_files: list[Path],
     model_name: str,
     device: torch.device,
     sample_frames: int,
+    batch_size: int = 64,
+    camera_name: str | None = None,
 ) -> EpisodeEmbeddingResult:
     repo_root = Path(__file__).resolve().parents[2]
     dinov2_root = repo_root / "dinov2"
     if str(dinov2_root) not in sys.path:
         sys.path.insert(0, str(dinov2_root))
 
-    from extract_feature.extract_image_features import (
-        extract_cls_features,
-        load_model,
-        make_transform,
-    )
+    from extract_feature.extract_image_features import load_model, make_transform
 
     transform = make_transform()
     model = load_model(model_name, device)
@@ -205,21 +278,56 @@ def build_episode_embeddings(
         ep_id = int(stem.replace("episode", ""))
         with h5py.File(file_path, "r") as root:
             cameras = list(root["/observation"].keys())
-            if "head_camera" in cameras:
-                key = "head_camera"
-            else:
-                key = cameras[0]
+            key = (
+                camera_name if camera_name in cameras else _default_camera_key(cameras)
+            )
             rgb_arr = root[f"/observation/{key}/rgb"][()]
 
         picked = _sample_indices(len(rgb_arr), sample_frames)
-        tensors = torch.stack([transform(_decode_rgb(rgb_arr[i])) for i in picked])
-        cls = extract_cls_features(model, tensors, device)
+        cls = _extract_cls_feature_batches(
+            rgb_arr[picked], model, transform, device, batch_size
+        )
         episode_ids.append(ep_id)
         embeddings.append(cls.mean(dim=0).cpu())
 
     return EpisodeEmbeddingResult(
         episode_ids=episode_ids, embeddings=torch.stack(embeddings)
     )
+
+
+def build_frame_embeddings(
+    episode_files: list[Path],
+    model_name: str,
+    device: torch.device,
+    camera_name: str | None = None,
+    batch_size: int = 64,
+) -> torch.Tensor:
+    repo_root = Path(__file__).resolve().parents[2]
+    dinov2_root = repo_root / "dinov2"
+    if str(dinov2_root) not in sys.path:
+        sys.path.insert(0, str(dinov2_root))
+
+    from extract_feature.extract_image_features import load_model, make_transform
+
+    transform = make_transform()
+    model = load_model(model_name, device)
+    all_features: list[torch.Tensor] = []
+
+    for file_path in episode_files:
+        with h5py.File(file_path, "r") as root:
+            cameras = list(root["/observation"].keys())
+            key = (
+                camera_name if camera_name in cameras else _default_camera_key(cameras)
+            )
+            rgb_arr = root[f"/observation/{key}/rgb"][()]
+        frame_features = _extract_cls_feature_batches(
+            rgb_arr, model, transform, device, batch_size
+        )
+        all_features.append(frame_features)
+
+    if not all_features:
+        raise ValueError("No frame embeddings extracted; episode_files is empty")
+    return torch.cat(all_features, dim=0)
 
 
 def compute_subset_metrics(embeddings: torch.Tensor) -> dict[str, float]:
