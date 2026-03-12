@@ -7,6 +7,7 @@ import torch
 from data_selection.feature_selector import (
     METRIC_REGISTRY,
     SELECTOR_REGISTRY,
+    build_frame_embeddings,
     build_episode_embeddings,
     compute_subset_metrics,
     save_selection_result,
@@ -38,10 +39,18 @@ def main() -> None:
     parser.add_argument("--episode-dir", type=Path, default=None)
     parser.add_argument("--model", type=str, default="dinov2_vits14")
     parser.add_argument("--sample-frames", type=int, default=8)
+    parser.add_argument("--feature-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--metric-level",
+        type=str,
+        default="episode",
+        choices=["episode", "frame"],
+    )
+    parser.add_argument("--frame-camera", type=str, default="head_camera")
     parser.add_argument(
         "--strategy",
         type=str,
-        default="greedy_maxdist",
+        default="random",
         choices=list(SELECTOR_REGISTRY.keys()),
     )
     parser.add_argument(
@@ -66,8 +75,22 @@ def main() -> None:
         model_name=args.model,
         device=torch.device(args.device),
         sample_frames=args.sample_frames,
+        batch_size=args.feature_batch_size,
+        camera_name=args.frame_camera,
     )
-    full_metrics = compute_subset_metrics(emb_res.embeddings)
+    if args.metric_level == "frame":
+        full_features = build_frame_embeddings(
+            episode_files=files,
+            model_name=args.model,
+            device=torch.device(args.device),
+            camera_name=args.frame_camera,
+            batch_size=args.feature_batch_size,
+        )
+        full_metrics = compute_subset_metrics(full_features)
+    else:
+        full_metrics = compute_subset_metrics(emb_res.embeddings)
+
+    file_map = {int(path.stem.replace("episode", "")): path for path in files}
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -83,6 +106,17 @@ def main() -> None:
             n_select=args.n_select,
             seed=run_seed,
         )
+
+        if args.metric_level == "frame":
+            selected_files = [file_map[ep_id] for ep_id in selected_ids]
+            selected_features = build_frame_embeddings(
+                episode_files=selected_files,
+                model_name=args.model,
+                device=torch.device(args.device),
+                camera_name=args.frame_camera,
+                batch_size=args.feature_batch_size,
+            )
+            selected_metrics = compute_subset_metrics(selected_features)
 
         score = selected_metrics[args.metric]
         out_json = args.output_dir / f"selection_{args.strategy}_seed{run_seed}.json"
@@ -102,11 +136,15 @@ def main() -> None:
                 "selection_file": str(out_json),
                 "seed": run_seed,
                 "strategy": args.strategy,
+                "metric_level": args.metric_level,
                 "primary_metric": args.metric,
                 "primary_metric_value": score,
                 "cosine_distance": selected_metrics["cosine_distance"],
                 "l2_distance": selected_metrics["l2_distance"],
                 "variance_score": selected_metrics["variance_score"],
+                "feature_mean": selected_metrics["feature_mean"],
+                "feature_std": selected_metrics["feature_std"],
+                "feature_var": selected_metrics["feature_var"],
                 "selected_episode_ids": ",".join(map(str, selected_ids)),
             }
         )
@@ -121,11 +159,15 @@ def main() -> None:
             "selection_file",
             "seed",
             "strategy",
+            "metric_level",
             "primary_metric",
             "primary_metric_value",
             "cosine_distance",
             "l2_distance",
             "variance_score",
+            "feature_mean",
+            "feature_std",
+            "feature_var",
             "selected_episode_ids",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
