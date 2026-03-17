@@ -120,3 +120,11 @@ you'll fin data under `${XDG_CACHE_HOME}/huggingface/lerobot/${repo_id}`
 ulw 看AGENTS.md 然后看report下的文档,特别是report/coop/目录下的文档,了解一下你的同事做过的一些工作 关于pi0的process_data脚本,目前做了一些修改，
 运行命令 ~/ws/RoboTwin/policy/pi0$ uv run bash process_data_pi0.sh click_bell demo_randomized 100 --selector-strategy random
  --selector-metric-level frame --pull-randomized-500 会得到当前selection_outputs里的东西还有processed_data下的数据，目前是会在select出的几个subset里面选一个进行处理，默认参数selector-subset-index为0，在这次的结果里面就是直接用第一次的seed42选择的episode作为数据集进行处理。现在做一下修改，给脚本再加一个arg，如果传入true，就处理所有subset，而不是按照subset-index
+
+
+
+uv run bash process_data_pi0.sh click_bell demo_randomized 100 --selector-strategy random --selector-metric-level frame --pull-randomized-500 --selector-process-all-subsets true
+
+uv run bash process_data_pi0.sh click_bell demo_randomized 100 --selector-strategy feature_std --selector-metric-level frame --selector-metric feature_std --pull-randomized-500 --selector-n-subsets 5 --selector-process-all-subsets true --selector-output-dir selection_outputs_feature_std_20260316_0 --subset-tag fstdgrad0
+
+uv run bash process_data_pi0.sh click_bell demo_randomized 100 --selector-strategy feature_var --selector-metric-level frame --selector-metric feature_var --pull-randomized-500 --selector-n-subsets 5 --selector-process-all-subsets true --selector-output-dir selection_outputs_feature_var_20260316_0 --subset-tag fvargrad0
