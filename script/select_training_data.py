@@ -9,7 +9,9 @@ from data_selection.feature_selector import (
     SELECTOR_REGISTRY,
     build_frame_embeddings,
     build_episode_embeddings,
+    build_episode_metric_scores,
     compute_subset_metrics,
+    plan_metric_gradient_subsets,
     save_selection_result,
     select_episode_indices,
 )
@@ -91,21 +93,51 @@ def main() -> None:
         full_metrics = compute_subset_metrics(emb_res.embeddings)
 
     file_map = {int(path.stem.replace("episode", "")): path for path in files}
+    metric_gradient_strategy = args.strategy in {"feature_std", "feature_var"}
+    if metric_gradient_strategy and args.metric_level != "frame":
+        raise ValueError(
+            "feature_std/feature_var strategy requires --metric-level frame"
+        )
+
+    if metric_gradient_strategy:
+        score_res = build_episode_metric_scores(
+            episode_files=files,
+            model_name=args.model,
+            metric_name=args.strategy,
+            device=torch.device(args.device),
+            camera_name=args.frame_camera,
+            batch_size=args.feature_batch_size,
+        )
+        planned_subsets = plan_metric_gradient_subsets(
+            episode_ids=score_res.episode_ids,
+            metric_values=score_res.metric_values,
+            n_select=args.n_select,
+            n_subsets=args.n_subsets,
+            seed=args.seed,
+        )
+        subset_runs = [
+            (args.seed + i, planned_subsets[i]) for i in range(args.n_subsets)
+        ]
+    else:
+        subset_runs = []
+        for i in range(args.n_subsets):
+            run_seed = args.seed + i
+            selected_ids, _ = select_episode_indices(
+                episode_ids=emb_res.episode_ids,
+                embeddings=emb_res.embeddings,
+                strategy=args.strategy,
+                n_select=args.n_select,
+                seed=run_seed,
+            )
+            subset_runs.append((run_seed, selected_ids))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     best_path: Path | None = None
     best_score = float("-inf")
 
-    for i in range(args.n_subsets):
-        run_seed = args.seed + i
-        selected_ids, selected_metrics = select_episode_indices(
-            episode_ids=emb_res.episode_ids,
-            embeddings=emb_res.embeddings,
-            strategy=args.strategy,
-            n_select=args.n_select,
-            seed=run_seed,
-        )
+    for run_seed, selected_ids in subset_runs:
+        selected_metrics = {}
 
         if args.metric_level == "frame":
             selected_files = [file_map[ep_id] for ep_id in selected_ids]
@@ -117,6 +149,13 @@ def main() -> None:
                 batch_size=args.feature_batch_size,
             )
             selected_metrics = compute_subset_metrics(selected_features)
+        else:
+            selected_local = [
+                emb_res.episode_ids.index(ep_id) for ep_id in selected_ids
+            ]
+            selected_metrics = compute_subset_metrics(
+                emb_res.embeddings[selected_local]
+            )
 
         score = selected_metrics[args.metric]
         out_json = args.output_dir / f"selection_{args.strategy}_seed{run_seed}.json"
@@ -145,6 +184,9 @@ def main() -> None:
                 "feature_mean": selected_metrics["feature_mean"],
                 "feature_std": selected_metrics["feature_std"],
                 "feature_var": selected_metrics["feature_var"],
+                "strategy_metric_value": selected_metrics[args.strategy]
+                if args.strategy in selected_metrics
+                else "",
                 "selected_episode_ids": ",".join(map(str, selected_ids)),
             }
         )
@@ -168,6 +210,7 @@ def main() -> None:
             "feature_mean",
             "feature_std",
             "feature_var",
+            "strategy_metric_value",
             "selected_episode_ids",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
