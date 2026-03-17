@@ -189,12 +189,41 @@ def _select_kmeans(embeddings: torch.Tensor, n_select: int, seed: int) -> list[i
     return selected
 
 
+def _select_by_embedding_dispersion(
+    embeddings: torch.Tensor,
+    n_select: int,
+    metric_fn: MetricFn,
+) -> list[int]:
+    n = embeddings.shape[0]
+    if n_select >= n:
+        return list(range(n))
+    scores = torch.tensor([metric_fn(embeddings[i : i + 1]) for i in range(n)])
+    order = torch.argsort(scores, descending=True).tolist()
+    return sorted(order[:n_select])
+
+
+def _select_feature_std(
+    embeddings: torch.Tensor, n_select: int, seed: int
+) -> list[int]:
+    del seed
+    return _select_by_embedding_dispersion(embeddings, n_select, _feature_std)
+
+
+def _select_feature_var(
+    embeddings: torch.Tensor, n_select: int, seed: int
+) -> list[int]:
+    del seed
+    return _select_by_embedding_dispersion(embeddings, n_select, _feature_var)
+
+
 SELECTOR_REGISTRY: dict[str, SelectorFn] = {
     "random": _select_random,
     "random_subsets": _select_random_subsets,
     "greedy_maxdist": _select_greedy_maxdist,
     "greedy_maxvar": _select_greedy_maxvar,
     "kmeans": _select_kmeans,
+    "feature_std": _select_feature_std,
+    "feature_var": _select_feature_var,
 }
 
 
@@ -208,6 +237,12 @@ def register_selector(name: str, selector_fn: SelectorFn) -> None:
 class EpisodeEmbeddingResult:
     episode_ids: list[int]
     embeddings: torch.Tensor
+
+
+@dataclass
+class EpisodeMetricScoreResult:
+    episode_ids: list[int]
+    metric_values: torch.Tensor
 
 
 def _default_camera_key(cameras: list[str]) -> str:
@@ -328,6 +363,113 @@ def build_frame_embeddings(
     if not all_features:
         raise ValueError("No frame embeddings extracted; episode_files is empty")
     return torch.cat(all_features, dim=0)
+
+
+def build_episode_metric_scores(
+    episode_files: list[Path],
+    model_name: str,
+    metric_name: str,
+    device: torch.device,
+    camera_name: str | None = None,
+    batch_size: int = 64,
+) -> EpisodeMetricScoreResult:
+    if metric_name not in METRIC_REGISTRY:
+        raise ValueError(f"Unknown metric: {metric_name}")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    dinov2_root = repo_root / "dinov2"
+    if str(dinov2_root) not in sys.path:
+        sys.path.insert(0, str(dinov2_root))
+
+    from extract_feature.extract_image_features import load_model, make_transform
+
+    transform = make_transform()
+    model = load_model(model_name, device)
+    metric_fn = METRIC_REGISTRY[metric_name]
+    episode_ids: list[int] = []
+    values: list[float] = []
+    for file_path in episode_files:
+        episode_id = int(file_path.stem.replace("episode", ""))
+        with h5py.File(file_path, "r") as root:
+            cameras = list(root["/observation"].keys())
+            key = (
+                camera_name if camera_name in cameras else _default_camera_key(cameras)
+            )
+            rgb_arr = root[f"/observation/{key}/rgb"][()]
+        frame_features = _extract_cls_feature_batches(
+            rgb_arr, model, transform, device, batch_size
+        )
+        episode_ids.append(episode_id)
+        values.append(metric_fn(frame_features))
+
+    return EpisodeMetricScoreResult(
+        episode_ids=episode_ids,
+        metric_values=torch.tensor(values, dtype=torch.float32),
+    )
+
+
+def plan_metric_gradient_subsets(
+    episode_ids: list[int],
+    metric_values: torch.Tensor,
+    n_select: int,
+    n_subsets: int,
+    seed: int,
+) -> list[list[int]]:
+    if len(episode_ids) != int(metric_values.shape[0]):
+        raise ValueError("episode_ids and metric_values length mismatch")
+    n_items = len(episode_ids)
+    if n_items == 0:
+        raise ValueError("empty episode set")
+    if n_select > n_items:
+        raise ValueError(f"n_select ({n_select}) > available episodes ({n_items})")
+    if n_subsets < 1:
+        raise ValueError("n_subsets must be >= 1")
+
+    # Build monotonic metric bins so each subset occupies a distinct metric range.
+    order = torch.argsort(metric_values, descending=False).tolist()
+    rng = np.random.default_rng(seed)
+    subsets: list[list[int]] = []
+    for subset_idx in range(n_subsets):
+        start = int(round(subset_idx * n_items / n_subsets))
+        end = int(round((subset_idx + 1) * n_items / n_subsets))
+        band = order[start:end]
+        if not band:
+            center = min(
+                max(int(round((subset_idx + 0.5) * n_items / n_subsets)), 0),
+                n_items - 1,
+            )
+            band = [order[center]]
+
+        if len(band) >= n_select:
+            chosen_local = rng.choice(band, size=n_select, replace=False).tolist()
+        else:
+            # Keep subset in its metric band first, then fill from nearest neighbors to preserve gradient.
+            chosen_local = list(band)
+            needed = n_select - len(chosen_local)
+            taken = set(chosen_local)
+            left = start - 1
+            right = end
+            while needed > 0 and (left >= 0 or right < n_items):
+                if left >= 0:
+                    cand = order[left]
+                    if cand not in taken:
+                        chosen_local.append(cand)
+                        taken.add(cand)
+                        needed -= 1
+                        if needed == 0:
+                            break
+                    left -= 1
+                if right < n_items:
+                    cand = order[right]
+                    if cand not in taken:
+                        chosen_local.append(cand)
+                        taken.add(cand)
+                        needed -= 1
+                    right += 1
+
+        chosen_ids = sorted(episode_ids[idx] for idx in chosen_local)
+        subsets.append(chosen_ids)
+    return subsets
 
 
 def compute_subset_metrics(embeddings: torch.Tensor) -> dict[str, float]:

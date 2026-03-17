@@ -21,11 +21,22 @@ from data_selection.feature_selector import (  # noqa: E402
     METRIC_REGISTRY,
     SELECTOR_REGISTRY,
     build_episode_embeddings,
+    build_episode_metric_scores,
     build_frame_embeddings,
     compute_subset_metrics,
+    plan_metric_gradient_subsets,
     save_selection_result,
     select_episode_indices,
 )
+
+
+def parse_bool_arg(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
 
 
 def load_episode_ids(episode_ids_file: str | None) -> list[int] | None:
@@ -104,7 +115,7 @@ def select_with_data_selection(
     episode_files: list[Path],
     n_select: int,
     args,
-) -> tuple[list[int], str]:
+) -> list[tuple[int, list[int]]]:
     output_dir = Path(args.selector_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.selector_device)
@@ -119,6 +130,10 @@ def select_with_data_selection(
     )
     file_map = {int(p.stem.replace("episode", "")): p for p in episode_files}
 
+    metric_gradient_strategy = args.selector_strategy in {"feature_std", "feature_var"}
+    if metric_gradient_strategy and args.selector_metric_level != "frame":
+        raise ValueError("feature_std/feature_var selection requires --selector-metric-level frame")
+
     if args.selector_metric_level == "frame":
         full_features = build_frame_embeddings(
             episode_files=episode_files,
@@ -131,17 +146,40 @@ def select_with_data_selection(
     else:
         full_metrics = compute_subset_metrics(emb_res.embeddings)
 
+    if metric_gradient_strategy:
+        score_res = build_episode_metric_scores(
+            episode_files=episode_files,
+            model_name=args.selector_model,
+            metric_name=args.selector_strategy,
+            device=device,
+            camera_name=args.selector_frame_camera,
+            batch_size=args.selector_batch_size,
+        )
+        planned_subsets = plan_metric_gradient_subsets(
+            episode_ids=score_res.episode_ids,
+            metric_values=score_res.metric_values,
+            n_select=n_select,
+            n_subsets=args.selector_n_subsets,
+            seed=args.selector_seed,
+        )
+        subset_runs = [(args.selector_seed + i, planned_subsets[i]) for i in range(args.selector_n_subsets)]
+    else:
+        subset_runs = []
+        for i in range(args.selector_n_subsets):
+            run_seed = args.selector_seed + i
+            selected_ids, _ = select_episode_indices(
+                episode_ids=emb_res.episode_ids,
+                embeddings=emb_res.embeddingstegy,
+                n_select=n_select,,
+                strategy=args.selector_stra
+                seed=run_seed,
+            )
+            subset_runs.append((run_seed, selected_ids))
+
     rows = []
     subsets = []
-    for i in range(args.selector_n_subsets):
-        run_seed = args.selector_seed + i
-        selected_ids, selected_metrics = select_episode_indices(
-            episode_ids=emb_res.episode_ids,
-            embeddings=emb_res.embeddings,
-            strategy=args.selector_strategy,
-            n_select=n_select,
-            seed=run_seed,
-        )
+    for run_seed, selected_ids in subset_runs:
+        selected_metrics = {}
 
         if args.selector_metric_level == "frame":
             selected_files = [file_map[ep_id] for ep_id in selected_ids]
@@ -153,6 +191,9 @@ def select_with_data_selection(
                 batch_size=args.selector_batch_size,
             )
             selected_metrics = compute_subset_metrics(selected_features)
+        else:
+            selected_local = [emb_res.episode_ids.index(ep_id) for ep_id in selected_ids]
+            selected_metrics = compute_subset_metrics(emb_res.embeddings[selected_local])
 
         score = selected_metrics[args.selector_metric]
         selection_file = output_dir / f"selection_{args.selector_strategy}_seed{run_seed}.json"
@@ -181,6 +222,9 @@ def select_with_data_selection(
                 "feature_mean": selected_metrics["feature_mean"],
                 "feature_std": selected_metrics["feature_std"],
                 "feature_var": selected_metrics["feature_var"],
+                "strategy_metric_value": selected_metrics[args.selector_strategy]
+                if args.selector_strategy in selected_metrics
+                else "",
                 "selected_episode_ids": ",".join(map(str, selected_ids)),
             }
         )
@@ -191,12 +235,7 @@ def select_with_data_selection(
         writer.writeheader()
         writer.writerows(rows)
 
-    subset_idx = args.selector_subset_index
-    if subset_idx < 0 or subset_idx >= len(subsets):
-        raise ValueError(f"selector_subset_index {subset_idx} out of range for {len(subsets)} subsets")
-    chosen_seed, chosen_ids = subsets[subset_idx]
-    subset_tag = args.subset_tag.strip() if args.subset_tag else f"sel{chosen_seed}"
-    return chosen_ids, subset_tag
+    return subsets
 
 
 def data_transform(
@@ -331,6 +370,13 @@ if __name__ == "__main__":
     parser.add_argument("--selector-n-subsets", type=int, default=5)
     parser.add_argument("--selector-seed", type=int, default=42)
     parser.add_argument("--selector-subset-index", type=int, default=0)
+    parser.add_argument(
+        "--selector-process-all-subsets",
+        type=parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=False,
+    )
     parser.add_argument("--selector-output-dir", type=str, default="selection_outputs")
     parser.add_argument(
         "--selector-device",
@@ -358,13 +404,33 @@ if __name__ == "__main__":
     selected_episode_ids = load_episode_ids(args.episode_ids_file)
     subset_tag = args.subset_tag.strip()
     if selected_episode_ids is None and args.selector_strategy is not None:
-        selected_episode_ids, subset_tag = select_with_data_selection(
+        subsets = select_with_data_selection(
             task_name=task_name,
             task_config=setting,
             episode_files=_episode_files(load_dir / "data"),
             n_select=expert_data_num,
             args=args,
         )
+
+        if args.selector_process_all_subsets:
+            for chosen_seed, chosen_ids in subsets:
+                seed_tag = f"sel{chosen_seed}"
+                current_subset_tag = seed_tag if not subset_tag else f"{subset_tag}-{seed_tag}"
+                target_name = f"{task_name}-{setting}-{expert_data_num}-{current_subset_tag}"
+                target_dir = Path("processed_data") / target_name
+                data_transform(
+                    load_dir=load_dir,
+                    episode_num=expert_data_num,
+                    save_path=target_dir,
+                    episode_ids=chosen_ids,
+                )
+            sys.exit(0)
+
+        subset_idx = args.selector_subset_index
+        if subset_idx < 0 or subset_idx >= len(subsets):
+            raise ValueError(f"selector_subset_index {subset_idx} out of range for {len(subsets)} subsets")
+        chosen_seed, selected_episode_ids = subsets[subset_idx]
+        subset_tag = subset_tag if subset_tag else f"sel{chosen_seed}"
 
     target_name = f"{task_name}-{setting}-{expert_data_num}"
     if subset_tag:
